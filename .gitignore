@@ -1,0 +1,3 @@
+*.pcap
+*.npy
+.venv/
