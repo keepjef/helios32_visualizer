@@ -11,10 +11,10 @@ VERTICAL_ANGLES = np.radians([
 ])
 
 class HeliosParser:
-    def __init__(self, pcap_path, frame_index, port=2368):
+    def __init__(self, pcap_path, frame_index, msop_port=2368):
         self.pcap_path = pcap_path
         self.frame_index = frame_index
-        self.port = int(port)
+        self.msop_port = int(msop_port)
         
         self.cos_v = np.cos(VERTICAL_ANGLES).astype(np.float32)
         self.sin_v = np.sin(VERTICAL_ANGLES).astype(np.float32)
@@ -53,10 +53,9 @@ class HeliosParser:
         if ip and ip.p == 17:
             try:
                 udp = ip.data
-                if udp.dport == self.port:
-                    return udp.data
+                return udp.dport, udp.data
             except: pass
-        return None
+        return None, None
 
     def load_frame(self, frame_id):
         start_packet = self.frame_index.frame_packets[frame_id]
@@ -104,8 +103,9 @@ class HeliosParser:
         return self._parse_payloads_numpy(frame_payloads)
 
     def _process_packet_to_list(self, buf, payloads_list):
-        payload = self._get_udp_payload(buf)
-        if payload and len(payload) >= 142:
+        dport, payload = self._get_udp_payload(buf)
+        # Фильтруем только данные MSOP
+        if dport == self.msop_port and payload and len(payload) >= 142:
             max_blocks = (len(payload) - 42) // 100
             if max_blocks > 12: max_blocks = 12
             if max_blocks > 0:
