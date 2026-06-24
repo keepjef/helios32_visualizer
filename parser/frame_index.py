@@ -68,6 +68,7 @@ class FrameIndex:
         valid_msop_count = 0
         valid_difop_count = 0
         current_msop_count = 0
+        msop_since_difop = 0
         
         with open(self.pcap_path, 'rb', buffering=16 * 1024 * 1024) as f:
             try:
@@ -84,13 +85,12 @@ class FrameIndex:
                 if dport == self.msop_port and payload and len(payload) >= 142:
                     valid_msop_count += 1
                     current_msop_count += 1
+                    msop_since_difop += 1
                     
                     azimuth = ((payload[44] << 8) | payload[45]) / 100.0
                     if last_azimuth != -1 and abs(azimuth - last_azimuth) > 90:
                         self.frame_packets.append(packet_idx)
-                        self.frame_stats.append({
-                            "msop_count": current_msop_count
-                        })
+                        self.frame_stats.append({"msop_count": current_msop_count})
                         current_msop_count = 0
                     last_azimuth = azimuth
                     
@@ -99,7 +99,7 @@ class FrameIndex:
                     if payload[0] == 0xA5 and payload[1] == 0xFF:
                         valid_difop_count += 1
                         try:
-                            # 1. Статика
+                            # Статика
                             mot_spd = int.from_bytes(payload[8:10], 'big')
                             lidar_ip = f"{payload[10]}.{payload[11]}.{payload[12]}.{payload[13]}"
                             dest_ip = f"{payload[14]}.{payload[15]}.{payload[16]}.{payload[17]}"
@@ -112,18 +112,16 @@ class FrameIndex:
                             bot_frm = " ".join([f"{x:02X}" for x in payload[43:48]])
                             sof_frm = " ".join([f"{x:02X}" for x in payload[48:53]])
                             mot_frm = " ".join([f"{x:02X}" for x in payload[53:58]])
-                            sn = "".join([f"{x:02X}" for x in payload[58:64]])
                             
-                            # === НОВОЕ: Определение режима возврата из смещения 300 ===
+                            # === ИСПРАВЛЕНО: Серийный номер находится на 292 байте ===
+                            sn = "".join([f"{x:02X}" for x in payload[292:298]])
+                            
                             ret_mode_val = payload[300]
                             return_mode = {
-                                0x00: "Dual Return",
-                                0x04: "Strongest Return",
-                                0x05: "Last Return",
-                                0x06: "First Return"
-                            }.get(ret_mode_val, f"Unknown (0x{ret_mode_val:02X})")
+                                0x00: "Dual Return", 0x04: "Strongest Return",
+                                0x05: "Last Return", 0x06: "First Return"
+                            }.get(ret_mode_val, f"Unknown")
                             
-                            # 2. Синхронизация и время
                             sync_mode_val = payload[301]
                             sync_mode = {0: "GPS", 1: "E2E-L4", 2: "P2P", 3: "gPTP", 4: "E2E-L2"}.get(sync_mode_val, str(sync_mode_val))
                             sync_state_val = payload[302]
@@ -137,29 +135,55 @@ class FrameIndex:
                             except Exception:
                                 hw_time_str = f"Raw: {hw_sec}s {hw_us}us"
                             
-                            # 3. Динамические статусы
                             current_raw = int.from_bytes(payload[313:315], 'big')
                             current = round(current_raw / 4096.0 * 5.0, 2) if current_raw != 0xFFFF else None
                             
                             voltage_raw = int.from_bytes(payload[317:319], 'big')
                             voltage = round(voltage_raw / 4096.0 * 24.5, 2) if voltage_raw != 0xFFFF else None
                             
-                            bot_fpga_raw = int.from_bytes(payload[331:333], 'big')
+                            # === НОВОЕ: Внутренние цепи 5V ===
+                            bot_5v_raw = int.from_bytes(payload[319:321], 'big')
+                            bot_5v = round(bot_5v_raw / 4096.0 * 11.0, 2) if bot_5v_raw != 0xFFFF else None
+                            
+                            main_5v_raw = int.from_bytes(payload[321:323], 'big')
+                            main_5v = round(main_5v_raw / 4096.0 * 10.0, 2) if main_5v_raw != 0xFFFF else None
+                            
+                            bot_fpga_raw = int.from_bytes(payload[342:344], 'big')
                             bot_fpga_temp = round(503.975 * bot_fpga_raw / 4096.0 - 273.15, 1) if bot_fpga_raw != 0xFFFF else None
                             
-                            main_bot_raw = int.from_bytes(payload[337:339], 'big')
+                            main_bot_raw = int.from_bytes(payload[348:350], 'big')
                             main_bot_temp = round(200.0 * main_bot_raw / 4096.0 - 50.0, 1) if main_bot_raw != 0xFFFF else None
                             
-                            main_fpga_raw = int.from_bytes(payload[339:341], 'big')
+                            main_fpga_raw = int.from_bytes(payload[350:352], 'big')
                             main_fpga_temp = round(503.975 * main_fpga_raw / 4096.0 - 273.15, 1) if main_fpga_raw != 0xFFFF else None
                             
-                            rpm_raw = int.from_bytes(payload[341:343], 'big')
-                            realtime_rpm = rpm_raw if rpm_raw < 0xF000 else None
+                            rpm_raw = int.from_bytes(payload[352:354], 'big')
+                            realtime_rpm = rpm_raw if rpm_raw != 0xFFFF else None
                             
-                            gps_st = payload[348]
+                            gps_st = payload[359]
                             pps_lock = (gps_st & 1)
                             gprmc_lock = (gps_st >> 1) & 1
                             utc_lock = (gps_st >> 2) & 1
+                            
+                            # === НОВОЕ: Парсинг NMEA GPRMC (Геолокация) ===
+                            gprmc_bytes = payload[382:468]
+                            # Отрезаем нули и декодируем
+                            gprmc_str = gprmc_bytes.split(b'\x00')[0].decode('ascii', errors='ignore').strip()
+                            gps_pos = "N/A"
+                            if gprmc_str.startswith("$GPRMC"):
+                                parts = gprmc_str.split(',')
+                                if len(parts) >= 8 and parts[2] == 'A': # A = Active (Сигнал валидный)
+                                    lat = f"{parts[3]} {parts[4]}"
+                                    lon = f"{parts[5]} {parts[6]}"
+                                    try:
+                                        # Переводим узлы (knots) в км/ч
+                                        speed_kmh = round(float(parts[7]) * 1.852, 1)
+                                        speed = f"{speed_kmh} km/h"
+                                    except ValueError:
+                                        speed = "0 km/h"
+                                    gps_pos = f"{lat}, {lon}, {speed}"
+                                elif len(parts) >= 3 and parts[2] == 'V':
+                                    gps_pos = "Searching satellites..."
 
                             self.difop_data.append({
                                 "ts": ts, "mot_spd": mot_spd, "lidar_ip": lidar_ip, "dest_ip": dest_ip,
@@ -168,20 +192,22 @@ class FrameIndex:
                                 "bot_frm": bot_frm, "sof_frm": sof_frm, "mot_frm": mot_frm,
                                 "return_mode": return_mode, "sync_mode": sync_mode, 
                                 "sync_state": sync_state, "hw_time": hw_time_str,
-                                "current": current, "voltage": voltage, "bot_fpga_temp": bot_fpga_temp,
-                                "main_bot_temp": main_bot_temp, "main_fpga_temp": main_fpga_temp,
+                                "current": current, "voltage": voltage, 
+                                "bot_5v": bot_5v, "main_5v": main_5v, # Внутренние цепи
+                                "bot_fpga_temp": bot_fpga_temp, "main_bot_temp": main_bot_temp, "main_fpga_temp": main_fpga_temp,
                                 "realtime_rpm": realtime_rpm, "pps_lock": pps_lock,
-                                "gprmc_lock": gprmc_lock, "utc_lock": utc_lock
+                                "gprmc_lock": gprmc_lock, "utc_lock": utc_lock,
+                                "gps_pos": gps_pos, # Геолокация
+                                "msop_rcvd": msop_since_difop
                             })
-                        except Exception:
+                            msop_since_difop = 0
+                            
+                        except Exception as e:
                             pass
 
                 packet_idx += 1
                 
-        self.frame_stats.append({
-            "msop_count": current_msop_count
-        })
-        
+        self.frame_stats.append({"msop_count": current_msop_count})
         print(f"Прочитано MSOP (3D): {valid_msop_count}")
         print(f"Прочитано DIFOP (Телеметрия): {valid_difop_count}")
 
